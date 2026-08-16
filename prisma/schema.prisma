@@ -1,0 +1,318 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ==========================================
+// 1. MASTER USER & EMPLOYEES
+// ==========================================
+
+enum Role {
+  ADMIN
+  EMPLOYEE
+}
+
+enum EmploymentStatus {
+  PERMANENT
+  CONTRACT
+  PROBATION
+}
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  passwordHash  String
+  role          Role      @default(EMPLOYEE)
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  employee      Employee?
+  auditLogs     AuditLog[]
+  notifications Notification[]
+
+  @@map("users")
+}
+
+model Department {
+  id          String     @id @default(uuid())
+  code        String     @unique
+  name        String
+  employees   Employee[]
+
+  @@map("departments")
+}
+
+model Employee {
+  id                String           @id @default(uuid())
+  userId            String           @unique
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  departmentId      String
+  department        Department       @relation(fields: [departmentId], references: [id])
+  
+  nip               String           @unique
+  fullName          String
+  phone             String?
+  joinDate          DateTime
+  status            EmploymentStatus @default(PROBATION)
+  
+  // Data Sensitif (Terenkripsi AES-256 di Application Level)
+  baseSalary        String           // Encrypted string nominal gaji
+  bankName          String?
+  bankAccountNumber String?          // Encrypted string nomor rekening
+  
+  // Data Pajak & BPJS
+  ptkpCode          String           @default("TK/0") // TK/0, K/0, K/1, dll.
+  npwp              String?
+  bpjsKesehatanNo   String?
+  bpjsTkNo          String?
+
+  attendances       Attendance[]
+  leaves            Leave[]
+  employeeAllowances EmployeeAllowance[]
+  employeeDeductions EmployeeDeduction[]
+  payrollItems      PayrollItem[]
+  reimbursements    Reimbursement[]
+
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  @@map("employees")
+}
+
+// ==========================================
+// 2. KOMPONEN GAJI DINAMIS (ALLOWANCES & DEDUCTIONS)
+// ==========================================
+
+enum ComponentType {
+  FIXED_AMOUNT    // Nominal Tetap (misal: Rp 500.000)
+  PERCENTAGE      // Persentase dari Gaji Pokok (misal: 5%)
+  DAILY_ATTENDANCE // Dihitung per hari hadir (misal: Uang Makan x Jumlah Hadir)
+}
+
+model AllowanceType {
+  id          String        @id @default(uuid())
+  name        String        // Contoh: Tunjangan Makan, Tunjangan Transport
+  type        ComponentType @default(FIXED_AMOUNT)
+  defaultValue Decimal      @db.Decimal(15, 2)
+  isTaxable   Boolean       @default(true)
+
+  employeeAllowances EmployeeAllowance[]
+
+  @@map("allowance_types")
+}
+
+model EmployeeAllowance {
+  id              String        @id @default(uuid())
+  employeeId      String
+  employee        Employee      @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  allowanceTypeId String
+  allowanceType   AllowanceType @relation(fields: [allowanceTypeId], references: [id])
+  amount          Decimal       @db.Decimal(15, 2)
+
+  @@unique([employeeId, allowanceTypeId])
+  @@map("employee_allowances")
+}
+
+model DeductionType {
+  id          String        @id @default(uuid())
+  name        String        // Contoh: Potongan Keterlambatan, Pinjaman
+  type        ComponentType @default(FIXED_AMOUNT)
+  defaultValue Decimal      @db.Decimal(15, 2)
+
+  employeeDeductions EmployeeDeduction[]
+
+  @@map("deduction_types")
+}
+
+model EmployeeDeduction {
+  id              String        @id @default(uuid())
+  employeeId      String
+  employee        Employee      @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  deductionTypeId String
+  deductionType   DeductionType @relation(fields: [deductionTypeId], references: [id])
+  amount          Decimal       @db.Decimal(15, 2)
+
+  @@unique([employeeId, deductionTypeId])
+  @@map("employee_deductions")
+}
+
+// ==========================================
+// 3. ABSENSI & CUTI
+// ==========================================
+
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  ABSENT
+  ON_LEAVE
+}
+
+model Attendance {
+  id          String           @id @default(uuid())
+  employeeId  String
+  employee    Employee         @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date        DateTime         @db.Date
+  clockIn     DateTime?
+  clockOut    DateTime?
+  status      AttendanceStatus @default(PRESENT)
+  workMinutes Int              @default(0)
+
+  @@unique([employeeId, date])
+  @@map("attendances")
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model Leave {
+  id          String      @id @default(uuid())
+  employeeId  String
+  employee    Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  startDate   DateTime    @db.Date
+  endDate     DateTime    @db.Date
+  reason      String
+  status      LeaveStatus @default(PENDING)
+  approvedBy  String?     // User ID Admin yang menyetujui
+  rejectReason String?    // Alasan penolakan
+
+  createdAt   DateTime    @default(now())
+
+  @@map("leaves")
+}
+
+// ==========================================
+// 4. PAYROLL & DATA LOCKING
+// ==========================================
+
+enum PayrollStatus {
+  DRAFT
+  IN_REVIEW
+  APPROVED
+  PAID
+}
+
+model Payroll {
+  id             String        @id @default(uuid())
+  periodMonth    Int           // 1 - 12
+  periodYear     Int           // YYYY
+  status         PayrollStatus @default(DRAFT)
+  totalDisbursed Decimal       @default(0) @db.Decimal(15, 2)
+  processedAt    DateTime?
+  
+  items          PayrollItem[]
+
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@unique([periodMonth, periodYear])
+  @@map("payrolls")
+}
+
+model PayrollItem {
+  id               String   @id @default(uuid())
+  payrollId        String
+  payroll          Payroll  @relation(fields: [payrollId], references: [id], onDelete: Cascade)
+  employeeId       String
+  employee         Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  // Snapshot Angka Finansial Saat Penggajian Dikunci (Locked Data)
+  baseSalarySnap   Decimal  @db.Decimal(15, 2)
+  totalAllowances  Decimal  @db.Decimal(15, 2)
+  totalDeductions  Decimal  @db.Decimal(15, 2)
+  bpjsEmployeeSnap Decimal  @db.Decimal(15, 2)
+  bpjsCompanySnap  Decimal  @db.Decimal(15, 2)
+  pph21Snap        Decimal  @db.Decimal(15, 2)
+  netSalary        Decimal  @db.Decimal(15, 2) // Take Home Pay
+
+  // Rincian Komponen simpan dalam JSONB agar aman & transparan
+  detailsJson      Json     // Format: { allowances: [...], deductions: [...] }
+  
+  reimbursements   Reimbursement[]
+
+  createdAt        DateTime @default(now())
+
+  @@unique([payrollId, employeeId])
+  @@map("payroll_items")
+}
+
+// ==========================================
+// 5. TABEL REFERENCE PAJAK PPH 21 TER
+// ==========================================
+
+model TaxTerRate {
+  id             String  @id @default(uuid())
+  category       String  // TER A, TER B, atau TER C
+  minGrossIncome Decimal @db.Decimal(15, 2)
+  maxGrossIncome Decimal @db.Decimal(15, 2)
+  percentage     Decimal @db.Decimal(5, 2) // Contoh: 0.50, 1.50, 5.00 dll
+
+  @@map("tax_ter_rates")
+}
+
+// ==========================================
+// 6. ANTI-FRAUD AUDIT LOG
+// ==========================================
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String   // CREATE, UPDATE, DELETE, PAYROLL_APPROVE
+  entity     String   // Employee, Payroll, Allowance, dll.
+  entityId   String?
+  oldValues  Json?    // Data sebelum diubah
+  newValues  Json?    // Data setelah diubah
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@map("audit_logs")
+}
+
+// ==========================================
+// 7. NOTIFICATIONS & REIMBURSEMENT
+// ==========================================
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  message   String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("notifications")
+}
+
+enum ReimbursementStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAID
+}
+
+model Reimbursement {
+  id          String              @id @default(uuid())
+  employeeId  String
+  employee    Employee            @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date        DateTime            @db.Date
+  amount      Decimal             @db.Decimal(15, 2)
+  description String
+  status      ReimbursementStatus @default(PENDING)
+  approvedBy  String?             // User ID admin
+  attachmentUrl String?           // URL atau path file bukti struk
+  rejectReason  String?           // Catatan jika ditolak
+  payrollItemId String?
+  payrollItem   PayrollItem?      @relation(fields: [payrollItemId], references: [id], onDelete: SetNull)
+  createdAt   DateTime            @default(now())
+
+  @@map("reimbursements")
+}
